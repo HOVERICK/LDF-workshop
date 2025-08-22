@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>방배정표 조회</title>
 
+<!-- XLSX 파서 -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
 <style>
@@ -22,7 +23,7 @@
   @media (max-width:760px){ .grid{grid-template-columns:1fr} .wrap{padding:16px} }
   .card{background:#fff;border:1px solid #eee;border-radius:14px;padding:14px}
   .t{font-size:13px;color:#666;margin-bottom:6px}
-  .v{font-size:16px;line-height:1.45;word-break:keep-all}
+  .v{font-size:16px;line-height:1.5;word-break:keep-all}
   .muted{color:#888}
   .err{color:#b00020;font-size:13px;margin-top:10px;white-space:pre-line}
   .hidden{display:none}
@@ -49,29 +50,31 @@
 </div>
 
 <script>
-/* ===== 경로/모드 ===== */
+/* ===== 파일 경로 ===== */
 const ROOMING_URL = "data/rooming.xlsx"; // 루밍리스트(시트별 1차/2차 …, 최소: 성명/방번호)
-const ROSTER_URL  = "data/roster.xlsx";  // 조 포함 리스트(최소: 성명/부서/차수)
+const ROSTER_URL  = "data/roster.xlsx";  // 조 포함 리스트(최소: 성명/소속부문(or 부서)/차수)
 const CONFIG_URL  = "data/config.json";  // {"active_batch":"1"} (선택)
 
+/* ===== 파라미터/모드 ===== */
 const params = new URLSearchParams(location.search);
 const isAdmin = params.get("admin") === "1";
 
-/* ===== 별칭(보강) ===== */
+/* ===== 별칭 ===== */
 const aliases = {
   name:  ["성명","이름","예약자명","신청자명","참여자명","성 명","Name","name"],
   room:  ["방번호","객실","룸","room","Room","객실번호","호실","호수","배정호수","객실명","객실호수"],
+  // 소속부문 우선 표기용(없으면 부서 사용)
+  division:["소속부문","부문","본부","사업부","소속","Division","division"],
   dept:  ["부서명","부서","소속부서","팀명","팀","근무부서","Department","dept"],
-  division:["소속부문","부문","본부","사업부","소속","Division"],
   batch: ["차수","회차","신청차수","차 수","차수(신청)","Batch","batch"]
 };
 
 /* ===== 상태 ===== */
-let activeBatch = "1";
-let roomingRows = []; // [{name, room}]
-let rosterRows  = []; // [{name, dept, division, batch}]
-let byRoom = new Map();
-let deptIndex = new Map();
+let activeBatch = "1";     // 기본값
+let roomingRows = [];      // [{name, room}]
+let rosterRows  = [];      // [{name, division, dept, batch}]
+let byRoom = new Map();    // room => [names...]
+let personIndex = new Map();// normName(name) => [{name, division, dept, batch}...]
 
 /* ===== 유틸 ===== */
 const $ = s => document.querySelector(s);
@@ -177,20 +180,22 @@ async function loadRoster(){
   for(const sheet of wb.SheetNames){
     const ws = wb.Sheets[sheet];
     const mat = toMatrix(ws);
-    const hIdx = findHeaderIdx(mat, ["name","dept","batch"]);
+    const hIdx = findHeaderIdx(mat, ["name","division","dept","batch"]);
     const header = mat[hIdx] || [];
     const data = mat.slice(hIdx+1);
-    const cmap = buildColMap(header, {name:aliases.name, dept:aliases.dept, division:aliases.division, batch:aliases.batch});
+    const cmap = buildColMap(header, {
+      name:aliases.name, division:aliases.division, dept:aliases.dept, batch:aliases.batch
+    });
     for(const row of data){
       const name = cmap.name>=0 ? norm(row[cmap.name]) : "";
       if(!name) continue;
-      const dept = cmap.dept>=0 ? norm(row[cmap.dept]) : "";
       const division = cmap.division>=0 ? norm(row[cmap.division]) : "";
-      const batchRaw = cmap.batch>=0 ? norm(row[cmap.batch]) : ""; // 없을 수도 있음
-      all.push({name, dept, division, batch: batchRaw});
+      const dept     = cmap.dept>=0 ? norm(row[cmap.dept]) : "";
+      const batchRaw = cmap.batch>=0 ? norm(row[cmap.batch]) : ""; // 없을 수 있음
+      all.push({name, division, dept, batch: batchRaw});
     }
   }
-  // 배치 필터: roster에 차수 컬럼이 없으면 rooming 시트로만 제한되므로 전체 허용
+  // 차수 필터 (roster에 차수가 있으면 걸러주고, 없으면 전체 허용)
   const filt = all.filter(r => {
     const n = onlyDigits(r.batch);
     return n ? (n === activeBatch) : true;
@@ -200,7 +205,7 @@ async function loadRoster(){
 
 /* ===== 인덱스 ===== */
 function buildIndexes(){
-  byRoom.clear(); deptIndex.clear();
+  byRoom.clear(); personIndex.clear();
   for(const r of roomingRows){
     const key = r.room || "(미배정)";
     if(!byRoom.has(key)) byRoom.set(key, []);
@@ -209,67 +214,64 @@ function buildIndexes(){
   }
   for(const r of rosterRows){
     const k = normName(r.name);
-    if(!deptIndex.has(k)) deptIndex.set(k, []);
-    deptIndex.get(k).push(r);
+    if(!personIndex.has(k)) personIndex.set(k, []);
+    personIndex.get(k).push(r);
   }
 }
 
-/* ===== 조회 ===== */
-function findDeptRecords(personName){
-  const list = deptIndex.get(normName(personName)) || [];
-  // roster에 차수 있으면 활성 차수 우선
+/* ===== 조회 보조 ===== */
+function findDivisionOrDept(name){
+  const list = personIndex.get(normName(name)) || [];
+  // roster에 차수가 있으면 활성 차수 우선
   const withBatch = list.filter(x => onlyDigits(x.batch));
-  if(withBatch.length){
-    return withBatch.filter(x => onlyDigits(x.batch) === activeBatch);
-  }
-  return list;
+  const candidates = withBatch.length ? withBatch.filter(x => onlyDigits(x.batch)===activeBatch) : list;
+  const rec = candidates[0];
+  // 소속부문 우선, 없으면 부서
+  return rec?.division || rec?.dept || "정보없음";
 }
-function renderResults(list){
-  const wrap = $("#results"); wrap.innerHTML="";
-  if(!list.length){
+
+/* ===== 렌더: 방(룸) 단위 카드 + 이름(소속부문) ===== */
+function renderResultsGroupedByRoom(roomList){
+  const wrap = $("#results"); 
+  wrap.innerHTML = "";
+
+  if(!roomList.length){
     wrap.innerHTML = `<div class="card"><div class="v muted">검색 결과가 없습니다. 철자(공백 포함)를 확인해 주세요.</div></div>`;
     return;
   }
-  for(const info of list){
-    const mates = info.roommates.length
-      ? info.roommates.map(m=>`${m.name}${m.dept?` (${m.dept})`:""}`).join(", ")
-      : "없음";
-    const deptStr = info.dept || info.division || "<span class='muted'>정보없음</span>";
+
+  // 방번호 정렬(숫자 우선)
+  const sortKey = r => parseInt((r||"").toString().match(/\d+/)?.[0] || "999999", 10);
+  roomList.sort((a,b)=> sortKey(a) - sortKey(b));
+
+  for(const room of roomList){
+    const namesInRoom = (byRoom.get(room) || []);
+    const formatted = namesInRoom.map(n=>{
+      const div = findDivisionOrDept(n); // 소속부문(우선) 또는 부서
+      return `${n}(${div})`;
+    }).join(", ");
+
     const card = document.createElement("div");
-    card.className="card";
+    card.className = "card";
     card.innerHTML = `
-      <div class="t">이름</div><div class="v">${info.name}</div>
-      <div class="t" style="margin-top:8px">방번호</div><div class="v">${info.room || "<span class='muted'>(미배정)</span>"}</div>
-      <div class="t" style="margin-top:8px">부서</div><div class="v">${deptStr}</div>
-      <div class="t" style="margin-top:8px">룸메이트</div><div class="v">${mates}</div>
+      <div class="t">참여자 성함</div>
+      <div class="v">${formatted || "<span class='muted'>정보없음</span>"}</div>
+
+      <div class="t" style="margin-top:8px">방 번호</div>
+      <div class="v">${room || "<span class='muted'>(미배정)</span>"}</div>
     `;
     wrap.appendChild(card);
   }
 }
+
+/* ===== 검색 핸들러: 사람 → 그 사람이 속한 방(들)로 묶어 보여주기 ===== */
 function handleSearch(){
   const term = norm($("#q").value);
   if(!term){ $("#results").innerHTML=""; return; }
   const key = normName(term);
   const hits = roomingRows.filter(r => normName(r.name).includes(key));
-  const cards = hits.map(r=>{
-    const mine = findDeptRecords(r.name);
-    const myDept = mine[0]?.dept || "";
-    const myDiv  = mine[0]?.division || "";
-    const mateNames = (byRoom.get(r.room) || []).filter(n => normName(n)!==normName(r.name));
-    const mates = mateNames.map(n=>{
-      const ds = findDeptRecords(n);
-      const d  = ds[0]?.dept || ds[0]?.division || "";
-      return {name:n, dept:d};
-    });
-    return {name:r.name, room:r.room, dept:myDept, division:myDiv, roommates:mates};
-  });
-  // 중복(동명이인 동일 방 중복) 제거
-  const seen=new Set(), uniq=[];
-  for(const c of cards){
-    const k=`${normName(c.name)}|${c.room}`;
-    if(!seen.has(k)){ seen.add(k); uniq.push(c); }
-  }
-  renderResults(uniq);
+  const rooms = Array.from(new Set(hits.map(r => r.room || "(미배정)")));
+  renderResultsGroupedByRoom(rooms);
 }
 
 /* ===== 초기화 ===== */
@@ -281,8 +283,8 @@ async function init(){
     await loadActiveBatch();
     if(isAdmin){ $("#adminPill").classList.remove("hidden"); $("#adminPill").textContent=`관리자: 활성 차수 ${activeBatch}차`; }
 
-    roomingRows = await loadRooming();
-    rosterRows  = await loadRoster();
+    roomingRows = await loadRooming();   // 활성 차수 시트만
+    rosterRows  = await loadRoster();    // (있다면) 해당 차수만 필터
     buildIndexes();
 
     show($("#loading"), false);
@@ -295,7 +297,7 @@ async function init(){
       "데이터 로딩 오류:\n" + e.message +
       "\n\n점검:\n1) 레포에 data/rooming.xlsx, data/roster.xlsx 존재\n" +
       "2) rooming.xlsx엔 '1차/2차' 등 시트가 있고, 시트에 성명/방번호 열 존재\n" +
-      "3) roster.xlsx엔 성명/부서(부문)/차수 열 존재 (차수 없으면 방 시트만으로 조회됨)\n" +
+      "3) roster.xlsx엔 성명/소속부문(또는 부서)/차수 열 존재 (차수 없으면 방 시트만으로 조회)\n" +
       "4) 주소에 ?b=1 또는 ?b=2 로 활성 차수 지정 가능";
     show($("#err"), true);
     console.error(e);
