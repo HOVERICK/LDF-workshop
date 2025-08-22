@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>룸메이트/부서 조회</title>
+
+<!-- XLSX 파서 -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<style>
+  *{box-sizing:border-box} html{-webkit-text-size-adjust:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR","Malgun Gothic",Arial,sans-serif;margin:0;background:#f7f7f9;color:#111}
+  .wrap{max-width:980px;margin:0 auto;padding:24px}
+  h1{font-size:20px;margin:0 0 14px}
+  .top{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+  .search{display:flex;gap:8px;width:100%}
+  input[type="text"]{flex:1;padding:14px 16px;border:1px solid #ddd;border-radius:12px;background:#fff;font-size:16px}
+  button{padding:14px 16px;border:1px solid #ddd;border-radius:12px;background:#111;color:#fff;font-size:15px;white-space:nowrap;cursor:pointer}
+  .adminNote{font-size:12px;color:#666;margin-top:6px}
+  .hint{font-size:12px;color:#666;margin:10px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+  @media (max-width:760px){ .grid{grid-template-columns:1fr} .wrap{padding:16px} }
+  .card{background:#fff;border:1px solid #eee;border-radius:14px;padding:14px}
+  .t{font-size:13px;color:#666;margin-bottom:6px}
+  .v{font-size:16px;line-height:1.45;word-break:keep-all}
+  .badge{display:inline-block;background:#f0f1f5;border:1px solid #e6e7ec;border-radius:8px;padding:2px 8px;font-size:12px;margin-left:6px}
+  .muted{color:#888}
+  .err{color:#b00020;font-size:13px;margin-top:10px}
+  .hidden{display:none}
+  .pill{display:inline-flex;gap:6px;align-items:center;border:1px solid #eee;background:#fff;border-radius:999px;padding:8px 10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>워크숍 룸/부서 조회</h1>
+    <div id="adminPill" class="pill hidden"></div>
+  </div>
+
+  <div class="search">
+    <input id="q" type="text" placeholder="이름을 입력하세요 (예: 홍길동)" enterkeyhint="search" autofocus>
+    <button id="btn">검색</button>
+    <button id="reload" class="hidden">데이터 새로고침</button>
+  </div>
+  <div id="hint" class="hint">※ 동명이인이 있으면 여러 카드가 표시됩니다. 소속 부서를 확인해 주세요.</div>
+  <div id="err" class="err hidden"></div>
+
+  <div id="results" class="grid"></div>
+</div>
+
+<script>
+/* ===== 파일 경로 ===== */
+const ROOMING_URL = "data/rooming.xlsx"; // 루밍리스트(시트별 1차/2차 …)
+const ROSTER_URL  = "data/roster.xlsx";  // 조 포함 리스트(부서/차수 포함)
+const CONFIG_URL  = "data/config.json";  // {"active_batch":"1"}
+
+/* ===== 파라미터/모드 ===== */
+const params = new URLSearchParams(location.search);
+const isAdmin = params.get("admin") === "1";
+
+/* ===== 별칭 ===== */
+const aliases = {
+  name: ["성명","이름","예약자명","신청자명","참여자명","성 명"],
+  room: ["방번호","객실","룸","room","Room","객실번호","호실","호수"],
+  dept: ["부서명","부서","소속부서","팀명","팀","근무부서"],
+  division: ["소속부문","부문","본부","사업부","소속"],
+  batch: ["차수","회차","신청차수","차 수","차수(신청)"],
+};
+
+/* ===== 상태 ===== */
+let activeBatch = "1";     // 기본값
+let roomingRows = [];      // [{name, room}]
+let rosterRows  = [];      // [{name, dept, division, batch}]
+let byRoom = new Map();    // room => [names...]
+let deptIndex = new Map(); // normName => [{name, dept, division, batch}...]
+
+/* ===== 유틸 ===== */
+const $ = s => document.querySelector(s);
+const norm = s => (s ?? "").toString()
+  .replace(/^\uFEFF/,"").replace(/[\u200B-\u200D\u2060]/g,"")
+  .trim();
+const normName = s => norm(s).replace(/\s+/g,"").replace(/[·ㆍ]/g,"");
+function valIn(obj, keys){ for(const k of keys){ if(k in obj) return obj[k]; } return ""; }
+
+/* ===== 엑셀 읽기 보조 ===== */
+async function fetchArrayBuffer(url){
+  const r = await fetch(url, {cache:"no-store"});
+  if(!r.ok) throw new Error(`파일 없음: ${url}`);
+  return await r.arrayBuffer();
+}
+function sheetToMatrix(ws){
+  return XLSX.utils.sheet_to_json(ws, {header:1, defval:""});
+}
+function scoreHeader(cells, wantKeys){
+  const set = cells.map(c => norm(c).replace(/\s+/g,"").toLowerCase());
+  let score=0;
+  for(const want of wantKeys){
+    const found = set.some(v => aliases[want].some(a => v.includes(norm(a).replace(/\s+/g,"").toLowerCase())));
+    if(found) score++;
+  }
+  return score;
+}
+function findHeaderIdx(matrix, wantKeys){
+  let best={idx:0,score:-1};
+  for(let i=0;i<Math.min(30,matrix.length);i++){
+    const row = matrix[i]||[];
+    const nonEmpty = row.filter(v=>norm(v).length>0).length;
+    if(nonEmpty<2) continue;
+    const sc = scoreHeader(row, wantKeys);
+    if(sc>best.score) best={idx:i,score:sc};
+  }
+  return best.score>=1?best.idx:0;
+}
+function buildColMap(header, mapKeys){
+  const idx = {};
+  const headerNorm = header.map(h => norm(h).replace(/\s+/g,"").toLowerCase());
+  for(const [key, aliasList] of Object.entries(mapKeys)){
+    let found = -1;
+    for(let i=0;i<header.length;i++){
+      const h = headerNorm[i];
+      if(aliasList.some(a => h.includes(norm(a).replace(/\s+/g,"").toLowerCase()))){
+        found = i; break;
+      }
+    }
+    idx[key] = found;
+  }
+  return idx;
+}
+
+/* ===== 시트 선택 (배치에 맞는 시트 찾기) ===== */
+function findSheetNameForBatch(wb, batchNum){
+  const b = String(batchNum);
+  const names = wb.SheetNames || [];
+  // 우선순위: "1차" 포함 → "1"만 포함 → 첫 시트
+  const normSheet = s => norm(s).toLowerCase().replace(/\s+/g,"");
+  let cand = names.find(n => normSheet(n).includes(b+"차")) ||
+             names.find(n => normSheet(n).includes(b)) ||
+             names[0];
+  return cand;
+}
+
+/* ===== 데이터 로딩 ===== */
+async function loadActiveBatch(){
+  const urlB = params.get("b");
+  if(urlB) { activeBatch = norm(urlB); return; }
+  try{
+    const r = await fetch(CONFIG_URL, {cache:"no-store"});
+    if(r.ok){
+      const j = await r.json();
+      if(j && j.active_batch) activeBatch = norm(j.active_batch);
+    }
+  }catch(e){ /* ignore, use default */ }
+}
+async function loadRooming(){
+  const buf = await fetchArrayBuffer(ROOMING_URL);
+  const wb = XLSX.read(buf, {type:"array"});
+  const sheetName = findSheetNameForBatch(wb, activeBatch);
+  const ws = wb.Sheets[sheetName];
+  if(!ws) throw new Error(`룸 시트 없음 (${sheetName})`);
+  const mat = sheetToMatrix(ws);
+  const headerIdx = findHeaderIdx(mat, ["name","room"]);
+  const header = mat[headerIdx] || [];
+  const data = mat.slice(headerIdx+1);
+
+  const cmap = buildColMap(header, {
+    name: aliases.name, room: aliases.room
+  });
+
+  const out=[];
+  for(const row of data){
+    const name = cmap.name>=0 ? norm(row[cmap.name]) : "";
+    const room = cmap.room>=0 ? norm(row[cmap.room]) : "";
+    if(!name) continue;
+    // 헤더/빈행 제거
+    if(aliases.name.includes(name)) continue;
+    out.push({ name, room });
+  }
+  return out;
+}
+async function loadRoster(){
+  const buf = await fetchArrayBuffer(ROSTER_URL);
+  const wb = XLSX.read(buf, {type:"array"});
+  const all=[];
+  for(const sheetName of wb.SheetNames){
+    const ws = wb.Sheets[sheetName];
+    const mat = sheetToMatrix(ws);
+    const headerIdx = findHeaderIdx(mat, ["name","dept","batch"]);
+    const header = mat[headerIdx] || [];
+    const data = mat.slice(headerIdx+1);
+    const cmap = buildColMap(header, {
+      name: aliases.name, dept: aliases.dept, division: aliases.division, batch: aliases.batch
+    });
+    for(const row of data){
+      const name = cmap.name>=0 ? norm(row[cmap.name]) : "";
+      const dept = cmap.dept>=0 ? norm(row[cmap.dept]) : "";
+      const division = cmap.division>=0 ? norm(row[cmap.division]) : "";
+      const batchRaw = cmap.batch>=0 ? norm(row[cmap.batch]) : "";
+      if(!name) continue;
+      all.push({ name, dept, division, batch: batchRaw });
+    }
+  }
+  // 배치 필터 (1, 1차, 1차수 모두 허용)
+  const filt = all.filter(r => {
+    const n = (r.batch.match(/\d+/)||[""])[0];
+    return n === activeBatch;
+  });
+  return filt;
+}
+
+/* ===== 인덱스 만들기 ===== */
+function buildIndexes(){
+  byRoom.clear(); deptIndex.clear();
+  for(const r of roomingRows){
+    const key = r.room || "(미배정)";
+    if(!byRoom.has(key)) byRoom.set(key, []);
+    // 동일 이름 중복 제거
+    const arr = byRoom.get(key);
+    if(!arr.includes(r.name)) arr.push(r.name);
+  }
+  for(const r of rosterRows){
+    const k = normName(r.name);
+    if(!deptIndex.has(k)) deptIndex.set(k, []);
+    deptIndex.get(k).push(r);
+  }
+}
+
+/* ===== 조회/렌더 ===== */
+function findDeptRecords(personName){
+  const hits = deptIndex.get(normName(personName)) || [];
+  // 같은 이름에서 활성 차수만 남겼지만, 혹시 다른 차수 잔여가 있으면 걸러줌
+  return hits.filter(h => {
+    const n = (h.batch.match(/\d+/)||[""])[0];
+    return n === activeBatch;
+  });
+}
+function renderResults(list){
+  const wrap = $("#results"); wrap.innerHTML = "";
+  if(!list.length){
+    wrap.innerHTML = `<div class="card"><div class="v muted">검색 결과가 없습니다. 철자(공백 포함)를 확인해 주세요.</div></div>`;
+    return;
+  }
+  list.forEach(info=>{
+    const el = document.createElement("div");
+    el.className="card";
+    const mateLines = info.roommates.length
+      ? info.roommates.map(m=>`${m.name}${m.dept?` (${m.dept})`:""}`).join(", ")
+      : "없음";
+    el.innerHTML = `
+      <div class="t">이름</div><div class="v">${info.name}</div>
+      <div class="t" style="margin-top:8px">방번호</div><div class="v">${info.room || "<span class='muted'>(미배정)</span>"}</div>
+      <div class="t" style="margin-top:8px">부서</div><div class="v">${info.dept || info.division || "<span class='muted'>정보없음</span>"}</div>
+      <div class="t" style="margin-top:8px">룸메이트</div><div class="v">${mateLines}</div>
+    `;
+    wrap.appendChild(el);
+  });
+}
+function handleSearch(){
+  const term = norm($("#q").value);
+  if(!term){ $("#results").innerHTML=""; return; }
+  const key = normName(term);
+
+  // 이름 부분일치 허용(앞/뒤 공백 제거 + 중점/공백 제거)
+  const matches = roomingRows.filter(r => normName(r.name).includes(key));
+
+  // 카드 데이터 구성
+  const cards = matches.map(r=>{
+    // 본인 부서/부문
+    const myDepts = findDeptRecords(r.name);
+    const myDept = myDepts[0]?.dept || "";
+    const myDiv  = myDepts[0]?.division || "";
+
+    // 룸메이트(같은 방의 타인들)
+    const matesRaw = (byRoom.get(r.room) || []).filter(n => normName(n)!==normName(r.name));
+    const mates = matesRaw.map(n=>{
+      const ds = findDeptRecords(n);
+      const d  = ds[0]?.dept || ds[0]?.division || "";
+      return { name:n, dept:d };
+    });
+    return { name:r.name, room:r.room, dept:myDept, division:myDiv, roommates: mates };
+  });
+
+  // 동명이인 중복 제거(같은 이름+방번호 중복 방지)
+  const uniq = [];
+  const seen = new Set();
+  for(const c of cards){
+    const k = `${normName(c.name)}|${c.room}`;
+    if(!seen.has(k)){ seen.add(k); uniq.push(c); }
+  }
+
+  renderResults(uniq);
+}
+
+/* ===== 초기화 ===== */
+async function init(){
+  $("#err").classList.add("hidden");
+  $("#reload").classList.toggle("hidden", !isAdmin);
+
+  try{
+    await loadActiveBatch();
+    if(isAdmin){
+      $("#adminPill").classList.remove("hidden");
+      $("#adminPill").textContent = `관리자: 활성 차수 ${activeBatch}차`;
+    }
+
+    roomingRows = await loadRooming();      // 활성 차수 시트만 로딩
+    rosterRows  = await loadRoster();       // 전체 시트 스캔 후 활성 차수 행만
+    buildIndexes();
+
+    // URL ?name=홍길동 프리셋
+    const preset = params.get("name");
+    if(preset){ $("#q").value = preset; handleSearch(); }
+  }catch(e){
+    $("#err").textContent = `데이터 로딩 오류: ${e.message}`;
+    $("#err").classList.remove("hidden");
+  }
+}
+
+/* ===== 이벤트 ===== */
+$("#btn").addEventListener("click", handleSearch);
+$("#q").addEventListener("keydown", e=>{ if(e.key==="Enter") handleSearch(); });
+$("#reload").addEventListener("click", init);
+
+/* run */
+init();
+</script>
+</body>
+</html>
